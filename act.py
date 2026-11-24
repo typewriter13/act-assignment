@@ -241,7 +241,7 @@ class ACT(nn.Module):
         src = torch.cat([self.latent_proj(z)[:, None], self.state_proj(state)[:, None], img_tokens], dim=1)
         pos = torch.cat([self.aux_pos, img_pos], dim=1)
         memory = self.encoder(src + pos)
-        out = self.decoder(self.queries.weight[None].expand(B, -1, -1), memory + pos)
+        out = self.decoder(self.queries.weight[None].expand(B, -1, -1), memory)
         return self.head(out), mu, logvar  # (B, k, action_dim)
 
 
