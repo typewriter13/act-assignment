@@ -11,6 +11,7 @@ import math
 import os
 import pickle
 import time
+from collections import deque
 
 import av
 import matplotlib
@@ -269,6 +270,80 @@ def evaluate(model, loader, device):
     return total / count
 
 
+class TemporalEnsembler:
+    """Temporal ensembling from the ACT paper (Zhao et al. 2023, Sec. 3.3).
+
+    The policy is queried at every timestep. Each query predicts actions for t..t+k-1, so the action
+    for timestep t has been predicted by up to k queries. They are averaged with weights
+    w_i = exp(-m * i), i = 0 being the oldest prediction; smaller m mixes in new observations faster.
+    Call reset() at the start of every episode.
+    """
+
+    def __init__(self, k, m=0.01):
+        self.k, self.m = k, m
+        self.reset()
+
+    def reset(self):
+        self.chunks = deque(maxlen=self.k)  # the last k predicted chunks, oldest first
+
+    def __call__(self, chunk):
+        """chunk (k, A) predicted at the current timestep -> action (A,) to execute now"""
+        self.chunks.append(chunk)
+        n = len(self.chunks)
+        # chunks[j] was predicted n-1-j steps ago, so its prediction for now sits at index n-1-j
+        preds = torch.stack([c[n - 1 - j] for j, c in enumerate(self.chunks)])  # (n, A)
+        w = torch.exp(-self.m * torch.arange(n, dtype=preds.dtype, device=preds.device))
+        return (w[:, None] * preds).sum(0) / w.sum()
+
+
+@torch.no_grad()
+def rollout_eval(model, ds, device, m=0.01, batch=32):
+    """Replay each held-out episode step by step and turn the predicted chunks into one action per step:
+      chunked  - query every k steps and execute the whole chunk (no ensembling)
+      first    - query every step and execute only the first action of the chunk
+      ensemble - query every step and use temporal ensembling
+    Reports L1 to the recorded actions and jitter (mean |a_t - a_{t-1}|), in normalized units.
+    Observations come from the recording (open loop), so this measures accuracy and smoothness,
+    not closed-loop task success.
+    """
+    model.eval()
+    k = model.queries.num_embeddings
+    ens = TemporalEnsembler(k, m)
+    s = ds.stats
+    out = {mode: [] for mode in ("chunked", "first", "ensemble")}
+    gts = []
+    for e in range(len(ds.states)):
+        idx = [i for i, (ep, _) in enumerate(ds.index) if ep == e]
+        # observations are recorded, so every chunk of the episode can be predicted in batches up front
+        chunks = []
+        for b in range(0, len(idx), batch):
+            samples = [ds[i] for i in idx[b : b + batch]]
+            imgs = torch.stack([x[0] for x in samples]).to(device)
+            state = torch.stack([x[1] for x in samples]).to(device)
+            chunks.append(model(imgs, state)[0].cpu())
+        chunks = torch.cat(chunks)  # (T, k, A): chunks[t] predicts actions t..t+k-1
+        T = len(chunks)
+        out["chunked"].append(chunks[::k].flatten(0, 1)[:T])
+        out["first"].append(chunks[:, 0])
+        ens.reset()
+        out["ensemble"].append(torch.stack([ens(chunks[t]) for t in range(T)]))
+        gts.append(torch.from_numpy((ds.actions[e] - s["a_mean"]) / s["a_std"]).float())
+    model.train()
+
+    def jitter(seqs):
+        return torch.cat([(x[1:] - x[:-1]).abs() for x in seqs]).mean().item()
+
+    gt = torch.cat(gts)
+    results = {f"{mode}_l1": (torch.cat(p) - gt).abs().mean().item() for mode, p in out.items()}
+    results.update({f"{mode}_jitter": jitter(p) for mode, p in out.items()})
+    results["recorded_jitter"] = jitter(gts)
+    print(f"rollout on {len(gts)} held-out episodes (m={m}):")
+    for mode in out:
+        print(f"  {mode:9s} L1 {results[mode + '_l1']:.3f}  jitter {results[mode + '_jitter']:.4f}")
+    print(f"  recorded  jitter {results['recorded_jitter']:.4f}")
+    return results
+
+
 # ----------------------------------------------------------------------------- train
 
 def main(a):
@@ -291,8 +366,15 @@ def main(a):
     val_loader = DataLoader(Subset(val_ds, range(0, len(val_ds), 20)), batch_size=a.batch,
                             num_workers=a.num_workers)
 
-    wandb.init(project="act-from-scratch", config=vars(a), mode="disabled" if a.no_wandb else "online")
     model = ACT().to(device)
+    if a.eval_ckpt:  # skip training: score a saved checkpoint with and without temporal ensembling
+        ckpt = torch.load(a.eval_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        val_ds.stats = {key: ckpt[key] for key in ("s_mean", "s_std", "a_mean", "a_std")}
+        rollout_eval(model, val_ds, device, a.ensemble_m)
+        return
+
+    wandb.init(project="act-from-scratch", config=vars(a), mode="disabled" if a.no_wandb else "online")
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     print("params (M):", sum(p.numel() for p in model.parameters()) / 1e6)
 
@@ -336,6 +418,7 @@ def main(a):
     plt.tight_layout()
     plt.savefig("assets/loss_curves.png", dpi=150)
     print("saved act.pt and assets/loss_curves.png")
+    wandb.log({f"rollout/{key}": v for key, v in rollout_eval(model, val_ds, device, a.ensemble_m).items()})
     wandb.finish()
 
 
@@ -351,4 +434,6 @@ if __name__ == "__main__":
     p.add_argument("--cache-dir", default="cache")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--ensemble-m", type=float, default=0.01, help="temporal ensembling weight decay m")
+    p.add_argument("--eval-ckpt", default=None, help="skip training; rollout-eval this checkpoint")
     main(p.parse_args())
